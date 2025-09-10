@@ -45,7 +45,14 @@ REGLAS:
 2) No inventes datos. Si un campo no existe, usa null.
 3) Si hay múltiples oportunidades en un mismo PDF, devuélvelas todas.
 4) Si no hay oportunidades, devuelve "opportunities": [].
-5) Sé muy estricto con el JSON (sin texto adicional)."""
+5) Sé muy estricto con el JSON (sin texto adicional).
+
+IMPORTANTE: Los PDFs pueden tener tablas mal convertidas. Busca activamente:
+- Texto que diga "Fecha límite:", "Deadline:", "Closing date:" seguido de fechas
+- "Estado:", "Status:" seguido de open/closed
+- "rolling" significa sin fecha límite fija
+- Montos con símbolos $ o palabras como "USD", "euros"
+- Si encuentras información relevante pero desconectada, úsala igual."""
 
 def read_pdf_text(filepath: Path) -> str:
     """

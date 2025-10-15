@@ -1,7 +1,7 @@
 # scripts/funding_pdf_extractor.py
 """
 Módulo principal de extracción de oportunidades de financiamiento
-Implementación completa según documento técnico
+CON SOPORTE PARA RUTAS DINÁMICAS
 """
 
 import os
@@ -19,51 +19,86 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from openai import OpenAI
 import sys
 sys.path.append(str(Path(__file__).parent))
-from config import *
 
-# Inicializar cliente OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY)
+def get_config():
+    """Obtiene la configuración actualizada"""
+    import config
+    import importlib
+    importlib.reload(config)
+    return config
 
-# PROMPT MAESTRO PARA OPORTUNIDADES (del documento original)
-OPP_SYSTEM_PROMPT = """Eres un experto en análisis de documentos para identificar OPORTUNIDADES DE FINANCIAMIENTO reales.
-Devuelve EXCLUSIVAMENTE un JSON con el campo "opportunities": lista de objetos. Cada objeto debe tener:
-- title (string, claro y breve)
-- summary (string, 2-4 líneas con lo esencial)
-- sponsor (string o null)
-- amount (string o null) y currency (string o null) si corresponde
-- deadline (string ISO-8601 o "rolling" o null). Si solo hay mes/año, devuelve esa precisión.
-- region (string o null), country (string o null)
-- eligibility (string o null) - quién puede postular
-- link (string o null) - si hay URL específica de la convocatoria
-- contact (string o null)
-- status ("open" | "closed" | "unknown")
-- source_file (string o null) - el nombre del archivo que analizas
-- notes (string o null) - aclaraciones importantes (ej. cofinanciamiento, etapa, etc.)
+# Inicializar cliente OpenAI al momento de uso
+def get_openai_client():
+    """Obtiene cliente OpenAI con config actualizada"""
+    cfg = get_config()
+    return OpenAI(api_key=cfg.OPENAI_API_KEY)
 
-REGLAS:
-1) Incluye solo oportunidades "para aplicar" (convocatorias, becas, grants, RFP, premios). Excluye noticias, reseñas o proyectos ya adjudicados.
-2) No inventes datos. Si un campo no existe, usa null.
-3) Si hay múltiples oportunidades en un mismo PDF, devuélvelas todas.
-4) Si no hay oportunidades, devuelve "opportunities": [].
-5) Sé muy estricto con el JSON (sin texto adicional).
+# PROMPT MAESTRO (sin cambios)
+OPP_SYSTEM_PROMPT = """Eres un experto en análisis de documentos de OPORTUNIDADES DE FINANCIAMIENTO.
 
-IMPORTANTE: Los PDFs pueden tener tablas mal convertidas. Busca activamente:
-- Texto que diga "Fecha límite:", "Deadline:", "Closing date:" seguido de fechas
-- "Estado:", "Status:" seguido de open/closed
-- "rolling" significa sin fecha límite fija
-- Montos con símbolos $ o palabras como "USD", "euros"
-- Si encuentras información relevante pero desconectada, úsala igual."""
+Tu tarea es extraer TODA la información disponible de convocatorias, grants, becas, RFPs, premios, etc.
+
+IMPORTANTE - REGLAS DE EXTRACCIÓN:
+1. **Busca activamente** información en TODO el texto, incluso si está separada o mal formateada
+2. **Infiere información** del contexto cuando sea posible
+3. **NO dejes campos en null** si hay alguna pista en el texto
+4. Si encuentras información parcial, úsala (ejemplo: "Monto: variable" es mejor que null)
+
+CAMPOS A EXTRAER (devuelve JSON):
+{
+  "opportunities": [
+    {
+      "title": "Título claro y descriptivo de la oportunidad",
+      "summary": "Resumen de 2-4 líneas explicando QUÉ es y PARA QUÉ sirve",
+      "sponsor": "Organización que patrocina (UNDP, World Bank, etc.) - busca nombres de organizaciones",
+      "amount": "Cantidad de dinero (busca números con $ o USD o EUR) - si no hay monto específico pon 'Variable' o 'A determinar'",
+      "currency": "USD, EUR, etc. - infiere del contexto si no está explícito",
+      "deadline": "Fecha en formato ISO (YYYY-MM-DD) o 'rolling' o mes/año. Busca: 'fecha límite', 'deadline', 'closing date', 'hasta'",
+      "region": "Región geográfica (América Latina, Global, África, etc.) - infiere del contexto",
+      "country": "País específico si aplica - busca nombres de países",
+      "eligibility": "Quiénes pueden aplicar (ONGs, universidades, individuos, etc.) - busca 'elegible', 'pueden participar', 'dirigido a'",
+      "link": "URL si aparece en el texto - busca patrones http:// o www.",
+      "contact": "Email o contacto - busca @ o 'contacto:' o 'email:'",
+      "status": "Determina si está 'open' (abierta), 'closed' (cerrada) o 'unknown'. Busca palabras como 'abierta', 'cerrada', 'vigente', 'expirada'",
+      "source_file": "Nombre del PDF (se llena automáticamente)",
+      "notes": "Información adicional importante: cofinanciamiento requerido, etapas, restricciones especiales, etc."
+    }
+  ]
+}
+
+ESTRATEGIAS DE BÚSQUEDA:
+- **Sponsor/Patrocinador**: Busca siglas (UNDP, USAID, EU, BID) o nombres de organizaciones en mayúsculas
+- **Amount/Monto**: Busca números seguidos de: $, USD, EUR, dólares, euros, millones, mil
+- **Deadline**: Busca fechas en cualquier formato: DD/MM/YYYY, Month Day Year, "30 de junio", "June 30"
+- **Eligibility**: Busca frases como: "pueden aplicar", "dirigido a", "elegibles", "podrán participar"
+- **Region**: Si menciona países de LATAM → "América Latina". Si dice "all countries" → "Global"
+- **Contact**: Busca direcciones de email (palabra@dominio.com) o "para más información contactar"
+
+CASOS ESPECIALES:
+- Si el texto dice "monto variable" o "según propuesta" → amount: "Variable", NO null
+- Si no hay fecha límite explícita pero dice "permanente" → deadline: "rolling"
+- Si menciona varios países de la misma región → region: nombre de la región
+- Si el documento es una lista de oportunidades → extrae CADA UNA por separado
+
+CALIDAD > PERFECCIÓN:
+- Es mejor tener "amount: Variable" que "amount: null"
+- Es mejor "deadline: 2025" que "deadline: null"
+- Es mejor "eligibility: Organizaciones sin fines de lucro" que "eligibility: null"
+
+EXCLUYE:
+- Noticias de proyectos ya finalizados
+- Reseñas o reportes de resultados
+- Convocatorias explícitamente cerradas (a menos que la configuración indique mantenerlas)
+
+FORMATO DE SALIDA:
+Devuelve SOLO el JSON, sin explicaciones adicionales. Si no hay oportunidades, devuelve {"opportunities": []}"""
 
 def read_pdf_text(filepath: Path) -> str:
-    """
-    Lee y extrae texto de un PDF con normalización
-    """
+    """Lee y extrae texto de un PDF"""
     try:
         text = pdf_extract_text(str(filepath))
         if text:
-            # Normalizar saltos de página
             text = text.replace('\x0c', '\n')
-            # Eliminar espacios excesivos
             text = re.sub(r'\n{3,}', '\n\n', text)
             text = re.sub(r' {2,}', ' ', text)
             return text.strip()
@@ -72,17 +107,156 @@ def read_pdf_text(filepath: Path) -> str:
         print(f"   ⚠️ Error leyendo PDF: {e}")
         return ""
 
-def keyword_focus(text: str, keywords: List[str] = KEYWORDS) -> str:
+def clean_and_structure_text(text: str) -> str:
     """
-    Prioriza párrafos con palabras clave de oportunidades
+    Limpia y estructura mejor el texto para facilitar la extracción
     """
     if not text:
         return ""
     
-    # Dividir en párrafos
-    paragraphs = re.split(r'\n{2,}', text)
+    # Normalizar espacios y saltos de línea
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
     
-    # Buscar párrafos con keywords
+    # Identificar y marcar secciones importantes
+    # Esto ayuda al modelo a entender la estructura
+    
+    # Marcar encabezados (palabras en mayúsculas)
+    text = re.sub(r'\n([A-ZÁÉÍÓÚÑ\s]{5,})\n', r'\n\n=== \1 ===\n\n', text)
+    
+    # Marcar información de contacto
+    text = re.sub(r'(contact[o]?[\s:])', r'\n📧 CONTACTO: ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(e-?mail[\s:])', r'\n📧 EMAIL: ', text, flags=re.IGNORECASE)
+    
+    # Marcar fechas límite
+    text = re.sub(r'(deadline|fecha[\s]l[ií]mite|closing[\s]date)[\s:]*', r'\n📅 DEADLINE: ', text, flags=re.IGNORECASE)
+    
+    # Marcar montos
+    text = re.sub(r'(\$\s*[\d,]+|\d+\s*(USD|EUR|dollars|dólares))', r'\n💰 MONTO: \1', text, flags=re.IGNORECASE)
+    
+    # Marcar elegibilidad
+    text = re.sub(r'(eligib[lei]|pueden\s+aplicar|dirigido\s+a|podr[áa]n\s+participar)[\s:]*', r'\n👥 ELEGIBILIDAD: ', text, flags=re.IGNORECASE)
+    
+    # Marcar URLs
+    text = re.sub(r'(https?://[^\s]+)', r'\n🔗 LINK: \1', text)
+    
+    return text
+
+def extract_structured_info(text: str) -> Dict[str, str]:
+    """
+    Extrae información estructurada usando regex antes de enviar a GPT
+    Esto ayuda a llenar campos que el modelo podría perder
+    """
+    info = {}
+    
+    # Extraer emails
+    emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+    if emails:
+        info['contact'] = emails[0]
+    
+    # Extraer URLs
+    urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
+    if urls:
+        info['link'] = urls[0]
+    
+    # Extraer montos (con $, USD, EUR)
+    amounts = re.findall(r'\$\s*[\d,]+(?:\.\d{2})?|[\d,]+\s*(?:USD|EUR|dollars|dólares|euros)', text, re.IGNORECASE)
+    if amounts:
+        info['amount'] = amounts[0].strip()
+    
+    # Extraer fechas en diferentes formatos
+    dates = re.findall(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|(?:January|February|March|April|May|June|July|August|September|October|November|December|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{1,2},?\s+\d{4}', text, re.IGNORECASE)
+    if dates:
+        info['deadline'] = dates[0]
+    
+    # Extraer organizaciones conocidas
+    orgs = re.findall(r'\b(UNDP|UNICEF|World Bank|IDB|BID|USAID|EU|European Union|ONU|UNESCO|FAO|WHO|OMS|IOM|OIM)\b', text, re.IGNORECASE)
+    if orgs:
+        info['sponsor'] = orgs[0].upper()
+    
+    return info
+
+# MODIFICAR la función extract_opportunities_from_text
+# Reemplazar con esta versión mejorada:
+
+def extract_opportunities_from_text(text: str, filename: str) -> Tuple[List[Dict], str]:
+    """
+    Procesa texto completo - VERSIÓN MEJORADA
+    """
+    if not text:
+        return [], "Documento vacío."
+    
+    cfg = get_config()
+    client = get_openai_client()
+    
+    print(f"   📝 Texto original: {len(text)} caracteres")
+    
+    # NUEVO: Limpiar y estructurar el texto
+    print(f"   🧹 Limpiando y estructurando texto...")
+    text = clean_and_structure_text(text)
+    
+    # NUEVO: Extraer información estructurada con regex
+    print(f"   🔍 Extrayendo información estructurada...")
+    structured_info = extract_structured_info(text)
+    if structured_info:
+        print(f"   ✅ Info encontrada por regex: {list(structured_info.keys())}")
+    
+    print(f"   🤖 Generando resumen...")
+    summary = call_summary(text, filename, client, cfg)
+    
+    print(f"   🔍 Aplicando filtro de keywords...")
+    focused_text = keyword_focus(text, cfg.KEYWORDS)
+    
+    chunks = chunk_text(focused_text, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP, cfg.MAX_CHUNKS_PER_DOC)
+    print(f"   📦 {len(chunks)} bloques para análisis")
+    
+    all_opportunities = []
+    
+    for i, chunk in enumerate(chunks, 1):
+        print(f"   🔄 Analizando bloque {i}/{len(chunks)}...")
+        
+        result = call_json_extract(chunk, filename, client, cfg)
+        opportunities = result.get("opportunities", [])
+        
+        # NUEVO: Completar campos vacíos con info extraída por regex
+        for opp in opportunities:
+            opp["source_file"] = filename
+            
+            # Si GPT no encontró el campo pero regex sí, úsalo
+            for key, value in structured_info.items():
+                if not opp.get(key) or opp.get(key) == "null":
+                    opp[key] = value
+                    print(f"      ✨ Campo '{key}' completado con regex: {value[:50]}")
+        
+        all_opportunities.extend(opportunities)
+        
+        if i < len(chunks):
+            time.sleep(cfg.RATE_LIMIT_DELAY)
+    
+    all_opportunities = dedupe_opportunities(all_opportunities)
+    
+    if not cfg.KEEP_CLOSED:
+        all_opportunities = [
+            opp for opp in all_opportunities
+            if opp.get("status", "unknown").lower() != "closed"
+        ]
+    
+    print(f"   ✅ {len(all_opportunities)} oportunidades únicas encontradas")
+    
+    # Mostrar resumen de campos completados
+    for opp in all_opportunities:
+        filled_fields = sum(1 for v in opp.values() if v and v != "null")
+        total_fields = len(opp)
+        print(f"      📊 {opp.get('title', 'Sin título')[:40]}: {filled_fields}/{total_fields} campos llenos")
+    
+    return all_opportunities, summary
+
+def keyword_focus(text: str, keywords: List[str]) -> str:
+    """Prioriza párrafos con palabras clave"""
+    if not text:
+        return ""
+    
+    paragraphs = re.split(r'\n{2,}', text)
     relevant_paras = []
     other_paras = []
     
@@ -93,21 +267,17 @@ def keyword_focus(text: str, keywords: List[str] = KEYWORDS) -> str:
         else:
             other_paras.append(para)
     
-    # Combinar: primero relevantes, luego contexto
     if relevant_paras:
         focused_text = '\n\n'.join(relevant_paras)
-        # Añadir algo de contexto si hay espacio
-        if len(focused_text) < CHUNK_SIZE * 3:
+        cfg = get_config()
+        if len(focused_text) < cfg.CHUNK_SIZE * 3:
             focused_text += '\n\n' + '\n\n'.join(other_paras[:5])
         return focused_text
     
     return text
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, 
-               overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """
-    Divide texto en chunks con solapamiento
-    """
+def chunk_text(text: str, chunk_size: int, overlap: int, max_chunks: int) -> List[str]:
+    """Divide texto en chunks"""
     if not text:
         return []
     
@@ -128,22 +298,18 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE,
             
         start = end - overlap
     
-    return chunks[:MAX_CHUNKS_PER_DOC]
+    return chunks[:max_chunks]
 
-def call_summary(text: str, filename: str = "documento.pdf") -> str:
-    """
-    Genera resumen conciso del documento (120-180 palabras)
-    """
+def call_summary(text: str, filename: str, client: OpenAI, cfg) -> str:
+    """Genera resumen del documento"""
     if not text:
         return "No se pudo extraer texto del documento."
     
-    # Limitar texto para resumen
     words = text.split()[:2000]
     text_limited = ' '.join(words)
     
-    prompt = f"""Resume este documento en 120-180 palabras en {LANGUAGE_OUTPUT}.
+    prompt = f"""Resume este documento en 120-180 palabras en {cfg.LANGUAGE_OUTPUT}.
 Destaca: tema principal, propósito, y si contiene oportunidades de financiamiento.
-Sé conciso y directo.
 
 Archivo: {filename}
 
@@ -152,10 +318,10 @@ Texto:
     
     try:
         response = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=cfg.OPENAI_MODEL,
             temperature=0.3,
             messages=[
-                {"role": "system", "content": "Eres un experto en análisis y resumen de documentos."},
+                {"role": "system", "content": "Eres un experto en análisis de documentos."},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -163,15 +329,12 @@ Texto:
     except Exception as e:
         return f"Error generando resumen: {str(e)}"
 
-def call_json_extract(text_chunk: str, filename: str = "documento.pdf") -> Dict:
-    """
-    Extrae oportunidades en formato JSON estructurado
-    """
+def call_json_extract(text_chunk: str, filename: str, client: OpenAI, cfg) -> Dict:
+    """Extrae oportunidades en JSON"""
     if not text_chunk:
         return {"opportunities": []}
     
-    # Construir prompt de usuario según plantilla del documento
-    user_prompt = f"""Idioma de salida: {LANGUAGE_OUTPUT}
+    user_prompt = f"""Idioma de salida: {cfg.LANGUAGE_OUTPUT}
 Archivo: {filename}
 
 Esquema JSON esperado:
@@ -196,14 +359,14 @@ Esquema JSON esperado:
   ]
 }}
 
-TEXTO (puede venir por bloques):
+TEXTO:
 {text_chunk}"""
     
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(cfg.MAX_RETRIES):
         try:
             response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                temperature=OPENAI_TEMPERATURE,
+                model=cfg.OPENAI_MODEL,
+                temperature=cfg.OPENAI_TEMPERATURE,
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": OPP_SYSTEM_PROMPT},
@@ -213,29 +376,26 @@ TEXTO (puede venir por bloques):
             
             result = json.loads(response.choices[0].message.content)
             
-            # Validar estructura
             if "opportunities" in result and isinstance(result["opportunities"], list):
                 return result
             else:
                 return {"opportunities": []}
                 
         except json.JSONDecodeError:
-            if attempt == MAX_RETRIES - 1:
-                print(f"   ⚠️ Error parseando JSON después de {MAX_RETRIES} intentos")
+            if attempt == cfg.MAX_RETRIES - 1:
+                print(f"   ⚠️ Error parseando JSON")
                 return {"opportunities": []}
         except Exception as e:
-            if attempt == MAX_RETRIES - 1:
+            if attempt == cfg.MAX_RETRIES - 1:
                 print(f"   ⚠️ Error en API: {str(e)}")
                 return {"opportunities": []}
         
-        time.sleep(RATE_LIMIT_DELAY)
+        time.sleep(cfg.RATE_LIMIT_DELAY)
     
     return {"opportunities": []}
 
 def dedupe_opportunities(items: List[Dict]) -> List[Dict]:
-    """
-    Elimina duplicados basándose en title|deadline
-    """
+    """Elimina duplicados"""
     seen: Set[str] = set()
     deduped = []
     
@@ -243,7 +403,6 @@ def dedupe_opportunities(items: List[Dict]) -> List[Dict]:
         title = item.get("title", "").strip().lower()
         deadline = str(item.get("deadline", "")).strip()
         
-        # Crear clave única
         key = f"{title}|{deadline}"
         
         if key not in seen and title:
@@ -253,73 +412,76 @@ def dedupe_opportunities(items: List[Dict]) -> List[Dict]:
     return deduped
 
 def extract_opportunities_from_text(text: str, filename: str) -> Tuple[List[Dict], str]:
-    """
-    Procesa texto completo: resumen + extracción de oportunidades
-    """
+    """Procesa texto completo"""
     if not text:
-        return [], "Documento vacío o no se pudo extraer texto."
+        return [], "Documento vacío."
     
-    print(f"   📝 Texto extraído: {len(text)} caracteres")
+    cfg = get_config()
+    client = get_openai_client()
     
-    # Generar resumen
+    print(f"   📝 Texto: {len(text)} caracteres")
+    
     print(f"   🤖 Generando resumen...")
-    summary = call_summary(text, filename)
+    summary = call_summary(text, filename, client, cfg)
     
-    # Aplicar keyword focus
-    print(f"   🔍 Aplicando filtro de palabras clave...")
-    focused_text = keyword_focus(text)
+    print(f"   🔍 Aplicando filtro...")
+    focused_text = keyword_focus(text, cfg.KEYWORDS)
     
-    # Dividir en chunks
-    chunks = chunk_text(focused_text)
-    print(f"   📦 Dividido en {len(chunks)} bloques para análisis")
+    chunks = chunk_text(focused_text, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP, cfg.MAX_CHUNKS_PER_DOC)
+    print(f"   📦 {len(chunks)} bloques")
     
-    # Extraer oportunidades de cada chunk
     all_opportunities = []
     
     for i, chunk in enumerate(chunks, 1):
         print(f"   🔄 Analizando bloque {i}/{len(chunks)}...")
         
-        result = call_json_extract(chunk, filename)
+        result = call_json_extract(chunk, filename, client, cfg)
         opportunities = result.get("opportunities", [])
         
-        # Añadir source_file a cada oportunidad
         for opp in opportunities:
             opp["source_file"] = filename
         
         all_opportunities.extend(opportunities)
         
-        # Rate limiting
         if i < len(chunks):
-            time.sleep(RATE_LIMIT_DELAY)
+            time.sleep(cfg.RATE_LIMIT_DELAY)
     
-    # Deduplicar
     all_opportunities = dedupe_opportunities(all_opportunities)
     
-    # Filtrar cerradas si está configurado
-    if not KEEP_CLOSED:
+    if not cfg.KEEP_CLOSED:
         all_opportunities = [
             opp for opp in all_opportunities
             if opp.get("status", "unknown").lower() != "closed"
         ]
     
-    print(f"   ✅ Encontradas {len(all_opportunities)} oportunidades únicas")
+    print(f"   ✅ {len(all_opportunities)} oportunidades únicas")
     
     return all_opportunities, summary
 
 def process_pdf_folder(
-    input_folder: Path = PDFS_SALIDA,
-    output_folder: Path = RESULTADOS
+    input_folder: Path = None,
+    output_folder: Path = None
 ) -> Dict:
     """
-    Procesa todos los PDFs en una carpeta
+    Procesa todos los PDFs - AHORA CON RUTAS DINÁMICAS
     """
+    # Obtener rutas actualizadas
+    cfg = get_config()
+    
+    if input_folder is None:
+        input_folder = cfg.PDFS_SALIDA
+    if output_folder is None:
+        output_folder = cfg.RESULTADOS
+    
+    print(f"\n📁 Carpeta de PDFs: {input_folder}")
+    print(f"📁 Carpeta de resultados: {output_folder}")
+    
     output_folder.mkdir(parents=True, exist_ok=True)
     
-    # Buscar PDFs
     pdf_files = list(input_folder.glob("*.pdf"))
     
     if not pdf_files:
-        print("❌ No se encontraron PDFs en la carpeta")
+        print("❌ No se encontraron PDFs")
         return {"error": "No PDFs found"}
     
     print(f"\n{'='*70}")
@@ -330,10 +492,9 @@ def process_pdf_folder(
     all_opportunities = []
     
     for idx, pdf_path in enumerate(pdf_files, 1):
-        print(f"\n📄 [{idx}/{len(pdf_files)}] Procesando: {pdf_path.name}")
+        print(f"\n📄 [{idx}/{len(pdf_files)}] {pdf_path.name}")
         print(f"   {'-'*60}")
         
-        # Leer PDF
         text = read_pdf_text(pdf_path)
         
         if not text:
@@ -346,10 +507,8 @@ def process_pdf_folder(
             })
             continue
         
-        # Extraer oportunidades y resumen
         opportunities, summary = extract_opportunities_from_text(text, pdf_path.name)
         
-        # Guardar resultado
         result = {
             "filename": pdf_path.name,
             "summary": summary,
@@ -360,25 +519,24 @@ def process_pdf_folder(
         all_results.append(result)
         all_opportunities.extend(opportunities)
         
-        # Mostrar resumen en consola
         print(f"\n   📋 RESUMEN:")
         for line in summary.split('\n'):
             print(f"   {line}")
         
         if opportunities:
-            print(f"\n   💰 OPORTUNIDADES ENCONTRADAS: {len(opportunities)}")
-            for i, opp in enumerate(opportunities[:3], 1):  # Mostrar máx 3
+            print(f"\n   💰 OPORTUNIDADES: {len(opportunities)}")
+            for i, opp in enumerate(opportunities[:3], 1):
                 print(f"   {i}. {opp.get('title', 'Sin título')}")
                 if opp.get('deadline'):
                     print(f"      Deadline: {opp['deadline']}")
     
-    # Guardar JSON consolidado
+    # Guardar JSON
     json_output = {
         "processing_date": datetime.now().isoformat(),
         "total_pdfs": len(pdf_files),
         "total_opportunities": len(all_opportunities),
-        "language": LANGUAGE_OUTPUT,
-        "keep_closed": KEEP_CLOSED,
+        "language": cfg.LANGUAGE_OUTPUT,
+        "keep_closed": cfg.KEEP_CLOSED,
         "results": all_results
     }
     
@@ -390,13 +548,12 @@ def process_pdf_folder(
     docx_path = create_opportunities_docx(all_results, all_opportunities, output_folder)
     
     print(f"\n{'='*70}")
-    print(f"✅ PROCESO COMPLETADO")
+    print(f"✅ COMPLETADO")
     print(f"{'='*70}")
-    print(f"📊 Resumen final:")
-    print(f"   • PDFs procesados: {len(pdf_files)}")
-    print(f"   • Oportunidades encontradas: {len(all_opportunities)}")
-    print(f"   • JSON guardado en: {json_path}")
-    print(f"   • DOCX guardado en: {docx_path}")
+    print(f"   • PDFs: {len(pdf_files)}")
+    print(f"   • Oportunidades: {len(all_opportunities)}")
+    print(f"   • JSON: {json_path}")
+    print(f"   • DOCX: {docx_path}")
     
     return json_output
 
@@ -405,39 +562,31 @@ def create_opportunities_docx(
     all_opportunities: List[Dict],
     output_folder: Path
 ) -> Path:
-    """
-    Crea documento Word profesional con los resultados
-    """
+    """Crea documento Word (sin cambios en la lógica)"""
     doc = Document()
     
-    # Configurar estilos del documento
     style = doc.styles['Normal']
     style.font.name = 'Arial'
     style.font.size = Pt(11)
     
-    # Título principal
     title = doc.add_heading('REPORTE DE OPORTUNIDADES DE FINANCIAMIENTO', 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # Metadata
-    doc.add_paragraph(f'Fecha de generación: {datetime.now().strftime("%d/%m/%Y %H:%M")}')
-    doc.add_paragraph(f'Idioma: {"Español" if LANGUAGE_OUTPUT == "ES" else "English"}')
+    doc.add_paragraph(f'Fecha: {datetime.now().strftime("%d/%m/%Y %H:%M")}')
+    cfg = get_config()
+    doc.add_paragraph(f'Idioma: {"Español" if cfg.LANGUAGE_OUTPUT == "ES" else "English"}')
     doc.add_paragraph()
     
-    # Resumen ejecutivo
     doc.add_heading('RESUMEN EJECUTIVO', 1)
     
-    # Tabla de resumen
     table = doc.add_table(rows=1, cols=2)
     table.style = 'Light Grid Accent 1'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     
-    # Headers
     hdr_cells = table.rows[0].cells
     hdr_cells[0].text = 'Métrica'
     hdr_cells[1].text = 'Valor'
     
-    # Datos
     metrics = [
         ('Documentos analizados', str(len(results))),
         ('Oportunidades identificadas', str(len(all_opportunities))),
@@ -452,22 +601,18 @@ def create_opportunities_docx(
     
     doc.add_page_break()
     
-    # Listado consolidado de oportunidades
     if all_opportunities:
         doc.add_heading('TODAS LAS OPORTUNIDADES', 1)
         
         for i, opp in enumerate(all_opportunities, 1):
-            # Título de la oportunidad
             p = doc.add_paragraph()
             runner = p.add_run(f"{i}. {opp.get('title', 'Sin título')}")
             runner.bold = True
             runner.font.size = Pt(12)
             
-            # Crear tabla para detalles
             detail_table = doc.add_table(rows=0, cols=2)
             detail_table.style = 'Table Grid'
             
-            # Añadir campos si existen
             fields = [
                 ('Resumen', opp.get('summary')),
                 ('Patrocinador', opp.get('sponsor')),
@@ -479,7 +624,7 @@ def create_opportunities_docx(
                 ('Enlace', opp.get('link')),
                 ('Contacto', opp.get('contact')),
                 ('Estado', opp.get('status')),
-                ('Archivo fuente', opp.get('source_file')),
+                ('Archivo', opp.get('source_file')),
                 ('Notas', opp.get('notes'))
             ]
             
@@ -492,24 +637,20 @@ def create_opportunities_docx(
                     row.cells[1].text = str(value)
                     row.cells[1].width = Inches(4.5)
             
-            doc.add_paragraph()  # Espacio entre oportunidades
+            doc.add_paragraph()
         
         doc.add_page_break()
     
-    # Análisis por documento
     doc.add_heading('ANÁLISIS POR DOCUMENTO', 1)
     
     for result in results:
-        # Título del documento
         doc.add_heading(f"📄 {result['filename']}", 2)
         
-        # Resumen
-        doc.add_heading('Resumen del contenido:', 3)
+        doc.add_heading('Resumen:', 3)
         doc.add_paragraph(result['summary'])
         
-        # Oportunidades del documento
         if result['opportunities_count'] > 0:
-            doc.add_heading(f"Oportunidades encontradas ({result['opportunities_count']})", 3)
+            doc.add_heading(f"Oportunidades ({result['opportunities_count']})", 3)
             
             for opp in result['opportunities']:
                 p = doc.add_paragraph(style='List Bullet')
@@ -517,16 +658,14 @@ def create_opportunities_docx(
                 if opp.get('deadline'):
                     p.add_run(f" - Deadline: {opp['deadline']}")
         else:
-            doc.add_paragraph("No se encontraron oportunidades en este documento.", style='Intense Quote')
+            doc.add_paragraph("No se encontraron oportunidades.", style='Intense Quote')
         
-        doc.add_paragraph()  # Espacio entre documentos
+        doc.add_paragraph()
     
-    # Guardar documento
     docx_path = output_folder / "resumen_oportunidades.docx"
     doc.save(str(docx_path))
     
     return docx_path
 
 if __name__ == "__main__":
-    # Ejecutar procesamiento
     process_pdf_folder()

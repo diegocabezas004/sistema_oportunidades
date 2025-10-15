@@ -86,9 +86,9 @@ class FundingOpportunitiesApp:
             'success': '#27AE60',
             'warning': '#F39C12',
             'danger': '#E74C3C',
-            'light': "#5C6769",
+            'light': '#ECF0F1',
             'dark': '#34495E',
-            'white': "#7B7272"
+            'white': '#FFFFFF'
         }
         
         # Configurar estilos
@@ -771,97 +771,6 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
                 folder_path.mkdir(parents=True, exist_ok=True)
                 self.log(f"   📁 {folder_name}: carpeta creada")
     
-    def change_folder(self, folder_type):
-        """Permite cambiar la ruta de una carpeta - VERSIÓN MEJORADA"""
-        titles = {
-            'entrada': "Seleccionar carpeta para PDFs de Entrada",
-            'salida': "Seleccionar carpeta para PDFs de Salida",
-            'resultados': "Seleccionar carpeta para Resultados"
-        }
-        
-        current_paths = {
-            'entrada': config.PDFS_ENTRADA,
-            'salida': config.PDFS_SALIDA,
-            'resultados': config.RESULTADOS
-        }
-        
-        # Abrir diálogo
-        new_path = filedialog.askdirectory(
-            title=titles[folder_type],
-            initialdir=str(current_paths[folder_type])
-        )
-        
-        if new_path:
-            # Confirmar
-            response = messagebox.askyesno(
-                "Confirmar cambio",
-                f"¿Cambiar la ruta de {folder_type} a:\n\n{new_path}\n\n"
-                "Los archivos se guardarán en esta nueva ubicación."
-            )
-            
-            if response:
-                self.log(f"🔄 Cambiando ruta de {folder_type}...")
-                
-                # Actualizar configuración
-                if folder_type == 'entrada':
-                    config.update_paths(entrada=new_path)
-                    self.path_entrada_label.config(text=new_path)
-                elif folder_type == 'salida':
-                    config.update_paths(salida=new_path)
-                    self.path_salida_label.config(text=new_path)
-                elif folder_type == 'resultados':
-                    config.update_paths(resultados=new_path)
-                    self.path_resultados_label.config(text=new_path)
-                
-                # IMPORTANTE: Recargar módulos con la nueva configuración
-                self.reload_paths()
-                
-                self.log(f"✅ Ruta actualizada exitosamente")
-                
-                messagebox.showinfo(
-                    "Ruta actualizada",
-                    f"La ruta de {folder_type} ha sido actualizada.\n\n"
-                    f"Nueva ubicación:\n{new_path}\n\n"
-                    "Los próximos archivos se guardarán aquí."
-                )
-    
-    def restore_default_paths(self):
-        """Restaura las rutas a sus valores por defecto - VERSIÓN MEJORADA"""
-        response = messagebox.askyesno(
-            "Restaurar rutas",
-            "¿Restaurar todas las rutas a sus valores por defecto?\n\n"
-            "Las rutas volverán a:\n"
-            "• pdfs_entrada/\n"
-            "• pdfs_salida/\n"
-            "• resultados/"
-        )
-        
-        if response:
-            self.log("🔄 Restaurando rutas por defecto...")
-            
-            base_dir = Path(__file__).parent
-            
-            # Actualizar todas las rutas
-            config.update_paths(
-                entrada=str(base_dir / "pdfs_entrada"),
-                salida=str(base_dir / "pdfs_salida"),
-                resultados=str(base_dir / "resultados")
-            )
-            
-            # Actualizar labels en la interfaz
-            self.path_entrada_label.config(text=str(config.PDFS_ENTRADA))
-            self.path_salida_label.config(text=str(config.PDFS_SALIDA))
-            self.path_resultados_label.config(text=str(config.RESULTADOS))
-            
-            # Recargar módulos
-            self.reload_paths()
-            
-            self.log("✅ Rutas restauradas correctamente")
-            messagebox.showinfo(
-                "Rutas restauradas",
-                "Las rutas han sido restauradas a sus valores por defecto."
-            )
-    
     # MÉTODOS DE FUNCIONALIDAD (continuación del código anterior)
     
     def log(self, message, level='info'):
@@ -1002,30 +911,28 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
     def export_thread(self, urls):
         try:
             self.log(f"🚀 Iniciando exportación de {len(urls)} URLs...")
-        
+            
             resultados = export_urls(urls)
-        
+            
             exitosos = sum(1 for r in resultados if r['status'] == 'success')
             errores = len(urls) - exitosos
-        
+            
             self.log(f"✅ Exportación completada: {exitosos} exitosos, {errores} errores")
-        
+            
             for r in resultados:
                 if r['status'] == 'success':
                     self.log(f"✅ {r['filename']}")
                 else:
                     self.log(f"❌ Error: {r['message'][:100]}", 'error')
-        
+            
             self.root.after(0, self.update_pdf_count)
-        
-            # ✅ CORRECCIÓN APLICADA
+            
             success_msg = f"✅ {exitosos} PDFs creados\n❌ {errores} errores"
             self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
                 "Exportación completada", msg
             ))
         
         except Exception as e:
-            # ✅ CORRECCIÓN APLICADA
             error_msg = str(e)
             self.log(f"❌ Error: {error_msg}", 'error')
             self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
@@ -1066,30 +973,30 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
         thread.start()
     
     def process_thread(self):
+        """Thread para procesar PDFs"""
         try:
             self.log("🤖 Iniciando análisis con IA...")
-        
+            
             resultado = process_pdf_folder()
-        
+            
             total_opps = resultado.get('total_opportunities', 0)
             total_pdfs = resultado.get('total_pdfs', 0)
-        
+            
             self.log(f"✅ Completado: {total_pdfs} PDFs, {total_opps} oportunidades")
-        
+            
             self.root.after(0, self.load_results)
-        
-            # ✅ CORRECCIÓN APLICADA
-            success_msg = f"✅ {total_pdfs} PDFs procesados\n💰 {total_opps} oportunidades"
-            self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
-                "Análisis completado", msg
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Análisis completado",
+                f"✅ {total_pdfs} PDFs procesados\n💰 {total_opps} oportunidades"
             ))
-        
+            
         except Exception as e:
-            # ✅ CORRECCIÓN APLICADA
-            error_msg = str(e)
-            self.log(f"❌ Error: {error_msg}", 'error')
-            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
-    
+            # --- INICIO DE LA CORRECCIÓN ---
+            error_message = str(e)
+            self.log(f"❌ Error: {error_message}", 'error')
+            self.root.after(0, lambda msg=error_message: messagebox.showerror("Error", msg))
+            # --- FIN DE LA CORRECCIÓN ---
+        
         finally:
             self.is_processing = False
             self.root.after(0, self.process_progress.stop)
@@ -1123,47 +1030,47 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
         thread.start()
     
     def pipeline_thread(self, urls):
+        """Thread para el pipeline completo"""
         try:
             self.log("🔄 PIPELINE INICIADO")
-        
+            
             # Exportar
             self.log(f"[1/2] Exportando {len(urls)} URLs...")
             resultados_export = export_urls(urls)
-        
+            
             exitosos = sum(1 for r in resultados_export if r['status'] == 'success')
-        
+            
             if exitosos == 0:
                 self.log("❌ No se pudo exportar ningún PDF", 'error')
                 return
-        
+            
             self.log(f"✅ {exitosos} PDFs creados")
-        
+            
             # Procesar
             import time
             time.sleep(2)
-        
+            
             self.log("[2/2] Analizando con IA...")
             resultado = process_pdf_folder()
-        
+            
             total_opps = resultado.get('total_opportunities', 0)
-        
+            
             self.log(f"🎉 PIPELINE COMPLETADO: {total_opps} oportunidades")
-        
+            
             self.root.after(0, self.load_results)
             self.root.after(0, self.update_pdf_count)
-        
-            # ✅ CORRECCIÓN APLICADA
-            success_msg = f"🎉 Proceso finalizado\n\n💰 {total_opps} oportunidades encontradas"
-            self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
-                "Pipeline completado", msg
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Pipeline completado",
+                f"🎉 Proceso finalizado\n\n💰 {total_opps} oportunidades encontradas"
             ))
-        
+            
         except Exception as e:
-            # ✅ CORRECCIÓN APLICADA
-            error_msg = str(e)
-            self.log(f"❌ Error: {error_msg}", 'error')
-            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
-    
+            # --- INICIO DE LA CORRECCIÓN ---
+            error_message = str(e)
+            self.log(f"❌ Error: {error_message}", 'error')
+            self.root.after(0, lambda msg=error_message: messagebox.showerror("Error", msg))
+            # --- FIN DE LA CORRECCIÓN ---
+        
         finally:
             self.is_processing = False
             self.root.after(0, self.pipeline_progress.stop)

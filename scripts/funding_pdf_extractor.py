@@ -1,7 +1,7 @@
 # scripts/funding_pdf_extractor.py
 """
 Módulo principal de extracción de oportunidades de financiamiento
-CON SOPORTE PARA RUTAS DINÁMICAS
+VERSIÓN FINAL CON EXTRACCIÓN HÍBRIDA (REGEX + GPT)
 """
 
 import os
@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Set, Tuple
 from pdfminer.high_level import extract_text as pdf_extract_text
+from pdfminer.layout import LAParams
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -27,229 +28,218 @@ def get_config():
     importlib.reload(config)
     return config
 
-# Inicializar cliente OpenAI al momento de uso
 def get_openai_client():
     """Obtiene cliente OpenAI con config actualizada"""
     cfg = get_config()
     return OpenAI(api_key=cfg.OPENAI_API_KEY)
 
-# PROMPT MAESTRO (sin cambios)
-OPP_SYSTEM_PROMPT = """Eres un experto en análisis de documentos de OPORTUNIDADES DE FINANCIAMIENTO.
+# PROMPT ULTRA ESPECÍFICO
+OPP_SYSTEM_PROMPT = """Eres experto en extraer información de Procurement Notices, especialmente de UNDP.
 
-Tu tarea es extraer TODA la información disponible de convocatorias, grants, becas, RFPs, premios, etc.
+MISIÓN: Extraer TODO, especialmente DEADLINE y CONTACT que son campos CRÍTICOS.
 
-IMPORTANTE - REGLAS DE EXTRACCIÓN:
-1. **Busca activamente** información en TODO el texto, incluso si está separada o mal formateada
-2. **Infiere información** del contexto cuando sea posible
-3. **NO dejes campos en null** si hay alguna pista en el texto
-4. Si encuentras información parcial, úsala (ejemplo: "Monto: variable" es mejor que null)
+CAMPOS OBLIGATORIOS (NUNCA en null):
+1. **deadline**: BUSCA "DEADLINE", fechas como "17-Oct-25", "@", "AM", "PM"
+2. **contact**: BUSCA emails con @ (especialmente @undp.org)
+3. **sponsor**: Si ves "UNDP" → sponsor: "UNDP"
+4. **amount**: Si no hay monto específico → "A determinar" (NO null)
+5. **region**: Infiere de país mencionado
+6. **country**: País específico si aparece
 
-CAMPOS A EXTRAER (devuelve JSON):
+ESTRATEGIA AGRESIVA:
+- "17-Oct-25 @ 01:59 AM" → deadline: "2025-10-17"
+- "adquisiciones.sv@undp.org" → contact: "adquisiciones.sv@undp.org"
+- "UNDP-SLV" → country: "El Salvador", sponsor: "UNDP"
+- "EL SALVADOR" → country: "El Salvador", region: "América Latina"
+- Sin monto → amount: "A determinar"
+- Sin deadline claro → deadline: "unknown"
+
+FORMATO JSON:
 {
-  "opportunities": [
-    {
-      "title": "Título claro y descriptivo de la oportunidad",
-      "summary": "Resumen de 2-4 líneas explicando QUÉ es y PARA QUÉ sirve",
-      "sponsor": "Organización que patrocina (UNDP, World Bank, etc.) - busca nombres de organizaciones",
-      "amount": "Cantidad de dinero (busca números con $ o USD o EUR) - si no hay monto específico pon 'Variable' o 'A determinar'",
-      "currency": "USD, EUR, etc. - infiere del contexto si no está explícito",
-      "deadline": "Fecha en formato ISO (YYYY-MM-DD) o 'rolling' o mes/año. Busca: 'fecha límite', 'deadline', 'closing date', 'hasta'",
-      "region": "Región geográfica (América Latina, Global, África, etc.) - infiere del contexto",
-      "country": "País específico si aplica - busca nombres de países",
-      "eligibility": "Quiénes pueden aplicar (ONGs, universidades, individuos, etc.) - busca 'elegible', 'pueden participar', 'dirigido a'",
-      "link": "URL si aparece en el texto - busca patrones http:// o www.",
-      "contact": "Email o contacto - busca @ o 'contacto:' o 'email:'",
-      "status": "Determina si está 'open' (abierta), 'closed' (cerrada) o 'unknown'. Busca palabras como 'abierta', 'cerrada', 'vigente', 'expirada'",
-      "source_file": "Nombre del PDF (se llena automáticamente)",
-      "notes": "Información adicional importante: cofinanciamiento requerido, etapas, restricciones especiales, etc."
-    }
-  ]
+  "opportunities": [{
+    "title": "string (OBLIGATORIO)",
+    "summary": "string (OBLIGATORIO)",
+    "sponsor": "UNDP u otra org",
+    "amount": "Variable o A determinar si no hay monto",
+    "currency": "USD por defecto",
+    "deadline": "YYYY-MM-DD o fecha en formato ISO",
+    "region": "América Latina, Global, etc.",
+    "country": "País específico",
+    "eligibility": "Quiénes pueden aplicar",
+    "link": "URL si existe",
+    "contact": "Email encontrado",
+    "status": "open si deadline futuro, unknown si no está claro",
+    "source_file": "nombre.pdf",
+    "notes": "Info adicional relevante"
+  }]
 }
 
-ESTRATEGIAS DE BÚSQUEDA:
-- **Sponsor/Patrocinador**: Busca siglas (UNDP, USAID, EU, BID) o nombres de organizaciones en mayúsculas
-- **Amount/Monto**: Busca números seguidos de: $, USD, EUR, dólares, euros, millones, mil
-- **Deadline**: Busca fechas en cualquier formato: DD/MM/YYYY, Month Day Year, "30 de junio", "June 30"
-- **Eligibility**: Busca frases como: "pueden aplicar", "dirigido a", "elegibles", "podrán participar"
-- **Region**: Si menciona países de LATAM → "América Latina". Si dice "all countries" → "Global"
-- **Contact**: Busca direcciones de email (palabra@dominio.com) o "para más información contactar"
+IMPORTANTE: Si la información preliminar ya provee deadline o contact, ÚSALA obligatoriamente."""
 
-CASOS ESPECIALES:
-- Si el texto dice "monto variable" o "según propuesta" → amount: "Variable", NO null
-- Si no hay fecha límite explícita pero dice "permanente" → deadline: "rolling"
-- Si menciona varios países de la misma región → region: nombre de la región
-- Si el documento es una lista de oportunidades → extrae CADA UNA por separado
-
-CALIDAD > PERFECCIÓN:
-- Es mejor tener "amount: Variable" que "amount: null"
-- Es mejor "deadline: 2025" que "deadline: null"
-- Es mejor "eligibility: Organizaciones sin fines de lucro" que "eligibility: null"
-
-EXCLUYE:
-- Noticias de proyectos ya finalizados
-- Reseñas o reportes de resultados
-- Convocatorias explícitamente cerradas (a menos que la configuración indique mantenerlas)
-
-FORMATO DE SALIDA:
-Devuelve SOLO el JSON, sin explicaciones adicionales. Si no hay oportunidades, devuelve {"opportunities": []}"""
-
-def read_pdf_text(filepath: Path) -> str:
-    """Lee y extrae texto de un PDF"""
+def read_pdf_text_enhanced(filepath: Path) -> str:
+    """Extracción mejorada con LAParams para mejor detección"""
     try:
-        text = pdf_extract_text(str(filepath))
-        if text:
+        # Método 1: Con LAParams optimizado
+        laparams = LAParams(
+            line_overlap=0.5,
+            char_margin=2.0,
+            line_margin=0.5,
+            word_margin=0.1,
+            boxes_flow=0.5,
+            detect_vertical=False,
+            all_texts=False
+        )
+        
+        text = pdf_extract_text(str(filepath), laparams=laparams)
+        
+        if text and len(text) > 50:
             text = text.replace('\x0c', '\n')
             text = re.sub(r'\n{3,}', '\n\n', text)
             text = re.sub(r' {2,}', ' ', text)
             return text.strip()
-        return ""
+        
+        # Método 2: Sin LAParams como fallback
+        print("   ⚠️ Reintentando extracción básica...")
+        text = pdf_extract_text(str(filepath))
+        return text.strip() if text else ""
+        
     except Exception as e:
-        print(f"   ⚠️ Error leyendo PDF: {e}")
+        print(f"   ⚠️ Error en extracción: {e}")
         return ""
 
+def extract_deadline_aggressive(text: str) -> Optional[str]:
+    """Extracción agresiva de deadline - optimizada para UNDP"""
+    
+    # Patrón 1: "17-Oct-25 @ 01:59 AM" (formato UNDP típico)
+    pattern1 = r'(\d{1,2})-([A-Z][a-z]{2})-(\d{2})\s*@\s*(\d{1,2}):(\d{2})\s*(AM|PM)'
+    match = re.search(pattern1, text, re.IGNORECASE)
+    if match:
+        day, month_str, year, hour, minute, ampm = match.groups()
+        
+        months = {
+            'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+            'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
+            'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+        }
+        month = months.get(month_str.lower()[:3], '01')
+        full_year = f"20{year}"
+        deadline = f"{full_year}-{month}-{day.zfill(2)}"
+        return deadline
+    
+    # Patrón 2: Buscar "DEADLINE" y fecha cercana
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if 'deadline' in line.lower():
+            context = '\n'.join(lines[i:min(i+3, len(lines))])
+            
+            date_patterns = [
+                r'(\d{1,2})-([A-Z][a-z]{2})-(\d{2,4})',
+                r'(\d{1,2})/(\d{1,2})/(\d{2,4})',
+                r'(\d{4})-(\d{2})-(\d{2})'
+            ]
+            
+            for pattern in date_patterns:
+                match = re.search(pattern, context)
+                if match:
+                    parts = match.groups()
+                    if len(parts) == 3:
+                        try:
+                            if '-' in match.group(0) and match.group(0)[2].isalpha():
+                                day, month_str, year = parts
+                                months = {
+                                    'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+                                    'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
+                                    'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+                                }
+                                month = months.get(month_str.lower()[:3], '01')
+                                full_year = f"20{year}" if len(year) == 2 else year
+                                return f"{full_year}-{month}-{day.zfill(2)}"
+                        except:
+                            pass
+    
+    return None
+
+def extract_contact_aggressive(text: str) -> Optional[str]:
+    """Extracción agresiva de email de contacto"""
+    
+    emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+    if emails:
+        # Priorizar emails de UNDP
+        for email in emails:
+            if 'undp' in email.lower():
+                return email
+        return emails[0]
+    
+    return None
+
+def extract_reference_number(text: str) -> Optional[str]:
+    """Extrae número de referencia formato UNDP"""
+    pattern = r'(UNDP-[A-Z]{3}-\d{5})'
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
 def clean_and_structure_text(text: str) -> str:
-    """
-    Limpia y estructura mejor el texto para facilitar la extracción
-    """
+    """Limpia y marca secciones importantes del texto"""
     if not text:
         return ""
     
-    # Normalizar espacios y saltos de línea
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
     
-    # Identificar y marcar secciones importantes
-    # Esto ayuda al modelo a entender la estructura
-    
-    # Marcar encabezados (palabras en mayúsculas)
-    text = re.sub(r'\n([A-ZÁÉÍÓÚÑ\s]{5,})\n', r'\n\n=== \1 ===\n\n', text)
-    
-    # Marcar información de contacto
-    text = re.sub(r'(contact[o]?[\s:])', r'\n📧 CONTACTO: ', text, flags=re.IGNORECASE)
-    text = re.sub(r'(e-?mail[\s:])', r'\n📧 EMAIL: ', text, flags=re.IGNORECASE)
-    
-    # Marcar fechas límite
-    text = re.sub(r'(deadline|fecha[\s]l[ií]mite|closing[\s]date)[\s:]*', r'\n📅 DEADLINE: ', text, flags=re.IGNORECASE)
-    
-    # Marcar montos
-    text = re.sub(r'(\$\s*[\d,]+|\d+\s*(USD|EUR|dollars|dólares))', r'\n💰 MONTO: \1', text, flags=re.IGNORECASE)
-    
-    # Marcar elegibilidad
-    text = re.sub(r'(eligib[lei]|pueden\s+aplicar|dirigido\s+a|podr[áa]n\s+participar)[\s:]*', r'\n👥 ELEGIBILIDAD: ', text, flags=re.IGNORECASE)
-    
-    # Marcar URLs
-    text = re.sub(r'(https?://[^\s]+)', r'\n🔗 LINK: \1', text)
+    # Marcar secciones críticas con emojis para que GPT las identifique mejor
+    text = re.sub(r'(DEADLINE[\s:]*)', r'\n\n⏰ DEADLINE CRÍTICO: ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(CONTACT[\s:]*)', r'\n\n📧 CONTACTO CRÍTICO: ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(REFERENCE\s+NUMBER[\s:]*)', r'\n\n🔢 REFERENCIA: ', text, flags=re.IGNORECASE)
+    text = re.sub(r'(\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b)', r'\n📧 EMAIL: \1', text)
     
     return text
 
 def extract_structured_info(text: str) -> Dict[str, str]:
-    """
-    Extrae información estructurada usando regex antes de enviar a GPT
-    Esto ayuda a llenar campos que el modelo podría perder
-    """
+    """Extracción estructurada con regex (complementa a GPT)"""
     info = {}
     
-    # Extraer emails
-    emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
-    if emails:
-        info['contact'] = emails[0]
+    # Deadline
+    deadline = extract_deadline_aggressive(text)
+    if deadline:
+        info['deadline'] = deadline
+        print(f"      🎯 Deadline regex: {deadline}")
     
-    # Extraer URLs
+    # Contact
+    contact = extract_contact_aggressive(text)
+    if contact:
+        info['contact'] = contact
+        print(f"      🎯 Contact regex: {contact}")
+    
+    # Reference
+    ref = extract_reference_number(text)
+    if ref:
+        info['reference'] = ref
+        print(f"      🎯 Referencia: {ref}")
+    
+    # Sponsor
+    if 'UNDP' in text or 'undp' in text.lower():
+        info['sponsor'] = 'UNDP'
+    
+    # País y región
+    text_upper = text.upper()
+    if 'EL SALVADOR' in text_upper or 'UNDP-SLV' in text:
+        info['country'] = 'El Salvador'
+        info['region'] = 'América Latina'
+    elif 'GUATEMALA' in text_upper or 'UNDP-GTM' in text:
+        info['country'] = 'Guatemala'
+        info['region'] = 'América Latina'
+    elif 'HONDURAS' in text_upper or 'UNDP-HND' in text:
+        info['country'] = 'Honduras'
+        info['region'] = 'América Latina'
+    
+    # URLs
     urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', text)
     if urls:
         info['link'] = urls[0]
     
-    # Extraer montos (con $, USD, EUR)
-    amounts = re.findall(r'\$\s*[\d,]+(?:\.\d{2})?|[\d,]+\s*(?:USD|EUR|dollars|dólares|euros)', text, re.IGNORECASE)
-    if amounts:
-        info['amount'] = amounts[0].strip()
-    
-    # Extraer fechas en diferentes formatos
-    dates = re.findall(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|(?:January|February|March|April|May|June|July|August|September|October|November|December|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+\d{1,2},?\s+\d{4}', text, re.IGNORECASE)
-    if dates:
-        info['deadline'] = dates[0]
-    
-    # Extraer organizaciones conocidas
-    orgs = re.findall(r'\b(UNDP|UNICEF|World Bank|IDB|BID|USAID|EU|European Union|ONU|UNESCO|FAO|WHO|OMS|IOM|OIM)\b', text, re.IGNORECASE)
-    if orgs:
-        info['sponsor'] = orgs[0].upper()
-    
     return info
-
-# MODIFICAR la función extract_opportunities_from_text
-# Reemplazar con esta versión mejorada:
-
-def extract_opportunities_from_text(text: str, filename: str) -> Tuple[List[Dict], str]:
-    """
-    Procesa texto completo - VERSIÓN MEJORADA
-    """
-    if not text:
-        return [], "Documento vacío."
-    
-    cfg = get_config()
-    client = get_openai_client()
-    
-    print(f"   📝 Texto original: {len(text)} caracteres")
-    
-    # NUEVO: Limpiar y estructurar el texto
-    print(f"   🧹 Limpiando y estructurando texto...")
-    text = clean_and_structure_text(text)
-    
-    # NUEVO: Extraer información estructurada con regex
-    print(f"   🔍 Extrayendo información estructurada...")
-    structured_info = extract_structured_info(text)
-    if structured_info:
-        print(f"   ✅ Info encontrada por regex: {list(structured_info.keys())}")
-    
-    print(f"   🤖 Generando resumen...")
-    summary = call_summary(text, filename, client, cfg)
-    
-    print(f"   🔍 Aplicando filtro de keywords...")
-    focused_text = keyword_focus(text, cfg.KEYWORDS)
-    
-    chunks = chunk_text(focused_text, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP, cfg.MAX_CHUNKS_PER_DOC)
-    print(f"   📦 {len(chunks)} bloques para análisis")
-    
-    all_opportunities = []
-    
-    for i, chunk in enumerate(chunks, 1):
-        print(f"   🔄 Analizando bloque {i}/{len(chunks)}...")
-        
-        result = call_json_extract(chunk, filename, client, cfg)
-        opportunities = result.get("opportunities", [])
-        
-        # NUEVO: Completar campos vacíos con info extraída por regex
-        for opp in opportunities:
-            opp["source_file"] = filename
-            
-            # Si GPT no encontró el campo pero regex sí, úsalo
-            for key, value in structured_info.items():
-                if not opp.get(key) or opp.get(key) == "null":
-                    opp[key] = value
-                    print(f"      ✨ Campo '{key}' completado con regex: {value[:50]}")
-        
-        all_opportunities.extend(opportunities)
-        
-        if i < len(chunks):
-            time.sleep(cfg.RATE_LIMIT_DELAY)
-    
-    all_opportunities = dedupe_opportunities(all_opportunities)
-    
-    if not cfg.KEEP_CLOSED:
-        all_opportunities = [
-            opp for opp in all_opportunities
-            if opp.get("status", "unknown").lower() != "closed"
-        ]
-    
-    print(f"   ✅ {len(all_opportunities)} oportunidades únicas encontradas")
-    
-    # Mostrar resumen de campos completados
-    for opp in all_opportunities:
-        filled_fields = sum(1 for v in opp.values() if v and v != "null")
-        total_fields = len(opp)
-        print(f"      📊 {opp.get('title', 'Sin título')[:40]}: {filled_fields}/{total_fields} campos llenos")
-    
-    return all_opportunities, summary
 
 def keyword_focus(text: str, keywords: List[str]) -> str:
     """Prioriza párrafos con palabras clave"""
@@ -257,51 +247,46 @@ def keyword_focus(text: str, keywords: List[str]) -> str:
         return ""
     
     paragraphs = re.split(r'\n{2,}', text)
-    relevant_paras = []
-    other_paras = []
+    relevant = []
+    other = []
     
     for para in paragraphs:
-        para_lower = para.lower()
-        if any(kw.lower() in para_lower for kw in keywords):
-            relevant_paras.append(para)
+        if any(kw.lower() in para.lower() for kw in keywords):
+            relevant.append(para)
         else:
-            other_paras.append(para)
+            other.append(para)
     
-    if relevant_paras:
-        focused_text = '\n\n'.join(relevant_paras)
+    if relevant:
+        focused = '\n\n'.join(relevant)
         cfg = get_config()
-        if len(focused_text) < cfg.CHUNK_SIZE * 3:
-            focused_text += '\n\n' + '\n\n'.join(other_paras[:5])
-        return focused_text
+        if len(focused) < cfg.CHUNK_SIZE * 3:
+            focused += '\n\n' + '\n\n'.join(other[:5])
+        return focused
     
     return text
 
 def chunk_text(text: str, chunk_size: int, overlap: int, max_chunks: int) -> List[str]:
-    """Divide texto en chunks"""
+    """Divide texto en chunks con overlap"""
     if not text:
         return []
     
     words = text.split()
-    chunks = []
-    
     if len(words) <= chunk_size:
         return [text]
     
+    chunks = []
     start = 0
     while start < len(words):
         end = min(start + chunk_size, len(words))
-        chunk = ' '.join(words[start:end])
-        chunks.append(chunk)
-        
+        chunks.append(' '.join(words[start:end]))
         if end >= len(words):
             break
-            
         start = end - overlap
     
     return chunks[:max_chunks]
 
 def call_summary(text: str, filename: str, client: OpenAI, cfg) -> str:
-    """Genera resumen del documento"""
+    """Genera resumen ejecutivo del documento"""
     if not text:
         return "No se pudo extraer texto del documento."
     
@@ -313,7 +298,6 @@ Destaca: tema principal, propósito, y si contiene oportunidades de financiamien
 
 Archivo: {filename}
 
-Texto:
 {text_limited}"""
     
     try:
@@ -329,38 +313,38 @@ Texto:
     except Exception as e:
         return f"Error generando resumen: {str(e)}"
 
-def call_json_extract(text_chunk: str, filename: str, client: OpenAI, cfg) -> Dict:
-    """Extrae oportunidades en JSON"""
+def call_json_extract(text_chunk: str, filename: str, structured_info: Dict, client: OpenAI, cfg) -> Dict:
+    """Extrae oportunidades con contexto de info ya encontrada"""
     if not text_chunk:
         return {"opportunities": []}
     
-    user_prompt = f"""Idioma de salida: {cfg.LANGUAGE_OUTPUT}
-Archivo: {filename}
+    # Crear hints con información ya extraída
+    hints = "\n".join([f"- {k}: {v}" for k, v in structured_info.items()])
+    
+    user_prompt = f"""Archivo: {filename}
+Idioma: {cfg.LANGUAGE_OUTPUT}
 
-Esquema JSON esperado:
-{{
-  "opportunities": [
-    {{
-      "title": "string",
-      "summary": "string",
-      "sponsor": "string|null",
-      "amount": "string|null",
-      "currency": "string|null",
-      "deadline": "string|null",
-      "region": "string|null",
-      "country": "string|null",
-      "eligibility": "string|null",
-      "link": "string|null",
-      "contact": "string|null",
-      "status": "open"|"closed"|"unknown",
-      "source_file": "string|null",
-      "notes": "string|null"
-    }}
-  ]
-}}
+⚠️ INFORMACIÓN YA EXTRAÍDA (USA ESTO OBLIGATORIAMENTE):
+{hints if hints else "No hay info preliminar"}
 
-TEXTO:
-{text_chunk}"""
+INSTRUCCIONES CRÍTICAS:
+1. Si la info de arriba tiene deadline → ÚSALO (NO busques otro)
+2. Si la info de arriba tiene contact → ÚSALO (NO busques otro)
+3. Si la info de arriba tiene sponsor → ÚSALO
+4. Para campos faltantes, extrae del texto
+5. Si NO encuentras monto → amount: "A determinar"
+6. Si NO encuentras currency → currency: "USD"
+
+BUSCA ACTIVAMENTE:
+- **title**: Título de la convocatoria
+- **summary**: Resumen de 2-4 líneas
+- **eligibility**: Quiénes pueden aplicar
+- **notes**: Info adicional importante
+
+TEXTO A ANALIZAR:
+{text_chunk}
+
+Devuelve JSON con opportunities. USA la info preliminar obligatoriamente."""
     
     for attempt in range(cfg.MAX_RETRIES):
         try:
@@ -378,8 +362,7 @@ TEXTO:
             
             if "opportunities" in result and isinstance(result["opportunities"], list):
                 return result
-            else:
-                return {"opportunities": []}
+            return {"opportunities": []}
                 
         except json.JSONDecodeError:
             if attempt == cfg.MAX_RETRIES - 1:
@@ -387,7 +370,7 @@ TEXTO:
                 return {"opportunities": []}
         except Exception as e:
             if attempt == cfg.MAX_RETRIES - 1:
-                print(f"   ⚠️ Error en API: {str(e)}")
+                print(f"   ⚠️ Error API: {str(e)}")
                 return {"opportunities": []}
         
         time.sleep(cfg.RATE_LIMIT_DELAY)
@@ -395,14 +378,13 @@ TEXTO:
     return {"opportunities": []}
 
 def dedupe_opportunities(items: List[Dict]) -> List[Dict]:
-    """Elimina duplicados"""
-    seen: Set[str] = set()
+    """Elimina oportunidades duplicadas"""
+    seen = set()
     deduped = []
     
     for item in items:
         title = item.get("title", "").strip().lower()
         deadline = str(item.get("deadline", "")).strip()
-        
         key = f"{title}|{deadline}"
         
         if key not in seen and title:
@@ -412,34 +394,72 @@ def dedupe_opportunities(items: List[Dict]) -> List[Dict]:
     return deduped
 
 def extract_opportunities_from_text(text: str, filename: str) -> Tuple[List[Dict], str]:
-    """Procesa texto completo"""
+    """Pipeline completo de extracción"""
     if not text:
-        return [], "Documento vacío."
+        return [], "Documento vacío o sin texto extraíble."
     
     cfg = get_config()
     client = get_openai_client()
     
-    print(f"   📝 Texto: {len(text)} caracteres")
+    print(f"   📝 Texto extraído: {len(text)} caracteres")
     
+    # Mostrar snippet para debug
+    print(f"   📄 Primeros 150 caracteres:")
+    print(f"      {text[:150].replace(chr(10), ' ')}")
+    
+    # Limpieza y estructuración
+    print(f"   🧹 Limpiando y estructurando...")
+    text = clean_and_structure_text(text)
+    
+    # REGEX PRIMERO (esto es clave)
+    print(f"   🔍 Extrayendo con regex...")
+    structured_info = extract_structured_info(text)
+    if structured_info:
+        print(f"   ✅ Regex encontró: {list(structured_info.keys())}")
+    else:
+        print(f"   ⚠️ Regex no encontró información clave")
+    
+    # Resumen
     print(f"   🤖 Generando resumen...")
     summary = call_summary(text, filename, client, cfg)
     
-    print(f"   🔍 Aplicando filtro...")
+    # Filtro de keywords
+    print(f"   🎯 Aplicando filtro de keywords...")
     focused_text = keyword_focus(text, cfg.KEYWORDS)
     
+    # Chunking
     chunks = chunk_text(focused_text, cfg.CHUNK_SIZE, cfg.CHUNK_OVERLAP, cfg.MAX_CHUNKS_PER_DOC)
-    print(f"   📦 {len(chunks)} bloques")
+    print(f"   📦 Texto dividido en {len(chunks)} bloques")
     
     all_opportunities = []
     
     for i, chunk in enumerate(chunks, 1):
         print(f"   🔄 Analizando bloque {i}/{len(chunks)}...")
         
-        result = call_json_extract(chunk, filename, client, cfg)
+        # Pasar structured_info a GPT
+        result = call_json_extract(chunk, filename, structured_info, client, cfg)
         opportunities = result.get("opportunities", [])
         
+        # FORZAR campos críticos de regex
         for opp in opportunities:
             opp["source_file"] = filename
+            
+            # Forzar deadline y contact si regex los encontró
+            for key in ['deadline', 'contact', 'sponsor', 'country', 'region', 'reference', 'link']:
+                if key in structured_info:
+                    if not opp.get(key) or opp.get(key) in [None, "null", "", "unknown"]:
+                        opp[key] = structured_info[key]
+                        print(f"      ✨ '{key}' FORZADO desde regex: {str(structured_info[key])[:50]}")
+            
+            # Valores por defecto para campos críticos
+            if not opp.get('deadline') or opp.get('deadline') in [None, "null", ""]:
+                opp['deadline'] = "unknown"
+            
+            if not opp.get('amount') or opp.get('amount') in [None, "null", ""]:
+                opp['amount'] = "A determinar"
+            
+            if not opp.get('currency') or opp.get('currency') in [None, "null", ""]:
+                opp['currency'] = "USD"
         
         all_opportunities.extend(opportunities)
         
@@ -454,18 +474,21 @@ def extract_opportunities_from_text(text: str, filename: str) -> Tuple[List[Dict
             if opp.get("status", "unknown").lower() != "closed"
         ]
     
-    print(f"   ✅ {len(all_opportunities)} oportunidades únicas")
+    print(f"   ✅ {len(all_opportunities)} oportunidades encontradas")
+    
+    # Estadísticas de completitud
+    for opp in all_opportunities:
+        filled = sum(1 for v in opp.values() if v and v not in [None, "null", ""])
+        total = len(opp)
+        print(f"      📊 {opp.get('title', 'Sin título')[:35]}: {filled}/{total} campos ({int(filled/total*100)}%)")
+        print(f"         💰 Amount: {opp.get('amount', 'N/A')}")
+        print(f"         📅 Deadline: {opp.get('deadline', 'N/A')}")
+        print(f"         📧 Contact: {opp.get('contact', 'N/A')}")
     
     return all_opportunities, summary
 
-def process_pdf_folder(
-    input_folder: Path = None,
-    output_folder: Path = None
-) -> Dict:
-    """
-    Procesa todos los PDFs - AHORA CON RUTAS DINÁMICAS
-    """
-    # Obtener rutas actualizadas
+def process_pdf_folder(input_folder: Path = None, output_folder: Path = None) -> Dict:
+    """Procesa todos los PDFs en una carpeta"""
     cfg = get_config()
     
     if input_folder is None:
@@ -481,7 +504,7 @@ def process_pdf_folder(
     pdf_files = list(input_folder.glob("*.pdf"))
     
     if not pdf_files:
-        print("❌ No se encontraron PDFs")
+        print("❌ No se encontraron PDFs en la carpeta")
         return {"error": "No PDFs found"}
     
     print(f"\n{'='*70}")
@@ -495,10 +518,10 @@ def process_pdf_folder(
         print(f"\n📄 [{idx}/{len(pdf_files)}] {pdf_path.name}")
         print(f"   {'-'*60}")
         
-        text = read_pdf_text(pdf_path)
+        text = read_pdf_text_enhanced(pdf_path)
         
-        if not text:
-            print(f"   ⚠️ No se pudo extraer texto")
+        if not text or len(text) < 50:
+            print(f"   ⚠️ No se pudo extraer texto suficiente")
             all_results.append({
                 "filename": pdf_path.name,
                 "summary": "No se pudo extraer texto del PDF",
@@ -520,15 +543,13 @@ def process_pdf_folder(
         all_opportunities.extend(opportunities)
         
         print(f"\n   📋 RESUMEN:")
-        for line in summary.split('\n'):
-            print(f"   {line}")
+        for line in summary.split('\n')[:3]:
+            print(f"      {line}")
         
         if opportunities:
-            print(f"\n   💰 OPORTUNIDADES: {len(opportunities)}")
-            for i, opp in enumerate(opportunities[:3], 1):
-                print(f"   {i}. {opp.get('title', 'Sin título')}")
-                if opp.get('deadline'):
-                    print(f"      Deadline: {opp['deadline']}")
+            print(f"\n   💰 {len(opportunities)} OPORTUNIDADES ENCONTRADAS:")
+            for i, opp in enumerate(opportunities[:2], 1):
+                print(f"      {i}. {opp.get('title', 'Sin título')[:60]}")
     
     # Guardar JSON
     json_output = {
@@ -548,21 +569,17 @@ def process_pdf_folder(
     docx_path = create_opportunities_docx(all_results, all_opportunities, output_folder)
     
     print(f"\n{'='*70}")
-    print(f"✅ COMPLETADO")
+    print(f"✅ PROCESO COMPLETADO")
     print(f"{'='*70}")
-    print(f"   • PDFs: {len(pdf_files)}")
-    print(f"   • Oportunidades: {len(all_opportunities)}")
-    print(f"   • JSON: {json_path}")
-    print(f"   • DOCX: {docx_path}")
+    print(f"   • PDFs procesados: {len(pdf_files)}")
+    print(f"   • Oportunidades encontradas: {len(all_opportunities)}")
+    print(f"   • Archivo JSON: {json_path}")
+    print(f"   • Documento Word: {docx_path}")
     
     return json_output
 
-def create_opportunities_docx(
-    results: List[Dict],
-    all_opportunities: List[Dict],
-    output_folder: Path
-) -> Path:
-    """Crea documento Word (sin cambios en la lógica)"""
+def create_opportunities_docx(results: List[Dict], all_opportunities: List[Dict], output_folder: Path) -> Path:
+    """Crea documento Word con los resultados"""
     doc = Document()
     
     style = doc.styles['Normal']
@@ -572,7 +589,8 @@ def create_opportunities_docx(
     title = doc.add_heading('REPORTE DE OPORTUNIDADES DE FINANCIAMIENTO', 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    doc.add_paragraph(f'Fecha: {datetime.now().strftime("%d/%m/%Y %H:%M")}')
+    doc.add_paragraph(f'Fecha de generación: {datetime.now().strftime("%d/%m/%Y %H:%M")}')
+    
     cfg = get_config()
     doc.add_paragraph(f'Idioma: {"Español" if cfg.LANGUAGE_OUTPUT == "ES" else "English"}')
     doc.add_paragraph()
@@ -591,7 +609,7 @@ def create_opportunities_docx(
         ('Documentos analizados', str(len(results))),
         ('Oportunidades identificadas', str(len(all_opportunities))),
         ('Oportunidades abiertas', str(sum(1 for o in all_opportunities if o.get('status') == 'open'))),
-        ('Oportunidades con deadline', str(sum(1 for o in all_opportunities if o.get('deadline'))))
+        ('Oportunidades con deadline', str(sum(1 for o in all_opportunities if o.get('deadline') and o.get('deadline') != 'unknown')))
     ]
     
     for metric, value in metrics:
@@ -624,12 +642,12 @@ def create_opportunities_docx(
                 ('Enlace', opp.get('link')),
                 ('Contacto', opp.get('contact')),
                 ('Estado', opp.get('status')),
-                ('Archivo', opp.get('source_file')),
+                ('Archivo fuente', opp.get('source_file')),
                 ('Notas', opp.get('notes'))
             ]
             
             for label, value in fields:
-                if value and str(value).strip():
+                if value and str(value).strip() and str(value) not in ["null", "None"]:
                     row = detail_table.add_row()
                     row.cells[0].text = label
                     row.cells[0].paragraphs[0].runs[0].bold = True
@@ -646,19 +664,19 @@ def create_opportunities_docx(
     for result in results:
         doc.add_heading(f"📄 {result['filename']}", 2)
         
-        doc.add_heading('Resumen:', 3)
+        doc.add_heading('Resumen del contenido:', 3)
         doc.add_paragraph(result['summary'])
         
         if result['opportunities_count'] > 0:
-            doc.add_heading(f"Oportunidades ({result['opportunities_count']})", 3)
+            doc.add_heading(f"Oportunidades encontradas ({result['opportunities_count']})", 3)
             
             for opp in result['opportunities']:
                 p = doc.add_paragraph(style='List Bullet')
                 p.add_run(opp.get('title', 'Sin título')).bold = True
-                if opp.get('deadline'):
+                if opp.get('deadline') and opp.get('deadline') != 'unknown':
                     p.add_run(f" - Deadline: {opp['deadline']}")
         else:
-            doc.add_paragraph("No se encontraron oportunidades.", style='Intense Quote')
+            doc.add_paragraph("No se encontraron oportunidades en este documento.", style='Intense Quote')
         
         doc.add_paragraph()
     

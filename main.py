@@ -3,6 +3,14 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+# Si no se pasan argumentos de línea de comandos, abrir GUI
+if len(sys.argv) == 1:
+    from gui_app import main as gui_main
+    gui_main()
+    sys.exit()
+
+# El resto del código main.py original continúa...
+
 # Añadir scripts al path
 sys.path.append(str(Path(__file__).parent / "scripts"))
 

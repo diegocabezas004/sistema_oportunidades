@@ -86,9 +86,9 @@ class FundingOpportunitiesApp:
             'success': '#27AE60',
             'warning': '#F39C12',
             'danger': '#E74C3C',
-            'light': '#ECF0F1',
+            'light': "#5C6769",
             'dark': '#34495E',
-            'white': '#FFFFFF'
+            'white': "#7B7272"
         }
         
         # Configurar estilos
@@ -1000,33 +1000,36 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
         thread.start()
     
     def export_thread(self, urls):
-        """Thread para exportar URLs"""
         try:
             self.log(f"🚀 Iniciando exportación de {len(urls)} URLs...")
-            
+        
             resultados = export_urls(urls)
-            
+        
             exitosos = sum(1 for r in resultados if r['status'] == 'success')
             errores = len(urls) - exitosos
-            
+        
             self.log(f"✅ Exportación completada: {exitosos} exitosos, {errores} errores")
-            
+        
             for r in resultados:
                 if r['status'] == 'success':
                     self.log(f"✅ {r['filename']}")
                 else:
                     self.log(f"❌ Error: {r['message'][:100]}", 'error')
-            
-            self.root.after(0, self.update_pdf_count)
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Exportación completada",
-                f"✅ {exitosos} PDFs creados\n❌ {errores} errores"
-            ))
-            
-        except Exception as e:
-            self.log(f"❌ Error: {str(e)}", 'error')
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
         
+            self.root.after(0, self.update_pdf_count)
+        
+            # ✅ CORRECCIÓN APLICADA
+            success_msg = f"✅ {exitosos} PDFs creados\n❌ {errores} errores"
+            self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
+                "Exportación completada", msg
+            ))
+        
+        except Exception as e:
+            # ✅ CORRECCIÓN APLICADA
+            error_msg = str(e)
+            self.log(f"❌ Error: {error_msg}", 'error')
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
+    
         finally:
             self.is_processing = False
             self.root.after(0, self.export_progress.stop)
@@ -1063,27 +1066,30 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
         thread.start()
     
     def process_thread(self):
-        """Thread para procesar PDFs"""
         try:
             self.log("🤖 Iniciando análisis con IA...")
-            
+        
             resultado = process_pdf_folder()
-            
+        
             total_opps = resultado.get('total_opportunities', 0)
             total_pdfs = resultado.get('total_pdfs', 0)
-            
-            self.log(f"✅ Completado: {total_pdfs} PDFs, {total_opps} oportunidades")
-            
-            self.root.after(0, self.load_results)
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Análisis completado",
-                f"✅ {total_pdfs} PDFs procesados\n💰 {total_opps} oportunidades"
-            ))
-            
-        except Exception as e:
-            self.log(f"❌ Error: {str(e)}", 'error')
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
         
+            self.log(f"✅ Completado: {total_pdfs} PDFs, {total_opps} oportunidades")
+        
+            self.root.after(0, self.load_results)
+        
+            # ✅ CORRECCIÓN APLICADA
+            success_msg = f"✅ {total_pdfs} PDFs procesados\n💰 {total_opps} oportunidades"
+            self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
+                "Análisis completado", msg
+            ))
+        
+        except Exception as e:
+            # ✅ CORRECCIÓN APLICADA
+            error_msg = str(e)
+            self.log(f"❌ Error: {error_msg}", 'error')
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
+    
         finally:
             self.is_processing = False
             self.root.after(0, self.process_progress.stop)
@@ -1117,44 +1123,47 @@ https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/home"""
         thread.start()
     
     def pipeline_thread(self, urls):
-        """Thread para el pipeline completo"""
         try:
             self.log("🔄 PIPELINE INICIADO")
-            
+        
             # Exportar
             self.log(f"[1/2] Exportando {len(urls)} URLs...")
             resultados_export = export_urls(urls)
-            
+        
             exitosos = sum(1 for r in resultados_export if r['status'] == 'success')
-            
+        
             if exitosos == 0:
                 self.log("❌ No se pudo exportar ningún PDF", 'error')
                 return
-            
+        
             self.log(f"✅ {exitosos} PDFs creados")
-            
+        
             # Procesar
             import time
             time.sleep(2)
-            
+        
             self.log("[2/2] Analizando con IA...")
             resultado = process_pdf_folder()
-            
+        
             total_opps = resultado.get('total_opportunities', 0)
-            
+        
             self.log(f"🎉 PIPELINE COMPLETADO: {total_opps} oportunidades")
-            
+        
             self.root.after(0, self.load_results)
             self.root.after(0, self.update_pdf_count)
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Pipeline completado",
-                f"🎉 Proceso finalizado\n\n💰 {total_opps} oportunidades encontradas"
-            ))
-            
-        except Exception as e:
-            self.log(f"❌ Error: {str(e)}", 'error')
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
         
+            # ✅ CORRECCIÓN APLICADA
+            success_msg = f"🎉 Proceso finalizado\n\n💰 {total_opps} oportunidades encontradas"
+            self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
+                "Pipeline completado", msg
+            ))
+        
+        except Exception as e:
+            # ✅ CORRECCIÓN APLICADA
+            error_msg = str(e)
+            self.log(f"❌ Error: {error_msg}", 'error')
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
+    
         finally:
             self.is_processing = False
             self.root.after(0, self.pipeline_progress.stop)

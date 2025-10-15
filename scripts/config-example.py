@@ -4,8 +4,8 @@ from pathlib import Path
 
 # Configuración de OpenAI
 OPEN_API_KEY = 'your api key'
-OPENAI_MODEL = "gpt-3.5-turbo"
-OPENAI_TEMPERATURE = 0.0
+OPENAI_MODEL = "gpt-4-turbo-preview"
+OPENAI_TEMPERATURE = 0.3
 
 # Rutas del proyecto
 BASE_DIR = Path(__file__).parent.parent
